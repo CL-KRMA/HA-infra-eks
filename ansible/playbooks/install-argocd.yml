@@ -1,0 +1,108 @@
+---
+- name: Installer ArgoCD sur EKS
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+
+  tasks:
+    # --- Ajouter repo ArgoCD (idempotent) ---
+    - name: Ajouter le repo Helm ArgoCD
+      command: helm repo add argo https://argoproj.github.io/argo-helm --force-update
+      changed_when: false
+
+    - name: Mettre a jour les repos Helm
+      command: helm repo update
+      changed_when: false
+
+    # --- Installer/mettre a jour ArgoCD ---
+    # server.service.type reste ClusterIP : l'acces externe passe par
+    # un Ingress Traefik (NLB AWS), comme pour Grafana.
+    #
+    # ATTENTION SECURITE : server.insecure=true fait servir ArgoCD en
+    # HTTP simple (pas de TLS interne). Le TLS est termine par Traefik ;
+    # seul le trajet interne Ingress -> pod reste en clair.
+    - name: Deployer/mettre a jour ArgoCD via Helm
+      command: >
+        helm upgrade --install argocd argo/argo-cd
+        --namespace argocd --create-namespace
+        --set server.service.type=ClusterIP
+        --set configs.params."server\.insecure"=true
+
+    # --- Ingress Traefik vers argocd_hostname, certificat Let's
+    #     Encrypt gere automatiquement par cert-manager (ClusterIssuer
+    #     letsencrypt-prod, voir playbooks/install-cert-manager.yml,
+    #     doit tourner AVANT ce playbook). ---
+    - name: Appliquer l'Ingress ArgoCD
+      command: kubectl apply -f -
+      args:
+        stdin: |
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: argocd-server-ingress
+            namespace: argocd
+            annotations:
+              traefik.ingress.kubernetes.io/router.entrypoints: websecure
+              cert-manager.io/cluster-issuer: letsencrypt-prod
+          spec:
+            ingressClassName: traefik
+            tls:
+              - hosts:
+                  - {{ argocd_hostname }}
+                secretName: argocd-server-tls
+            rules:
+              - host: {{ argocd_hostname }}
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: argocd-server
+                          port:
+                            number: 80
+
+    # --- Verifications ---
+    - name: Attendre que les deployments ArgoCD soient prets
+      command: kubectl -n argocd wait --for=condition=Available deployment --all --timeout=300s
+      changed_when: false
+
+    - name: Lister les pods ArgoCD
+      command: kubectl get pods -n argocd
+      register: result
+      changed_when: false
+
+    - debug:
+        msg: "{{ result.stdout }}"
+
+    # --- Verifier que le certificat Let's Encrypt a bien ete emis ---
+    - name: Attendre que le certificat TLS ArgoCD soit Ready
+      command: kubectl get certificate -n argocd argocd-server-tls -o jsonpath="{.status.conditions[?(@.type=='Ready')].status}"
+      register: cert_status
+      retries: 15
+      delay: 15
+      until: cert_status.stdout == "True"
+      changed_when: false
+      failed_when: false
+
+    - name: Avertissement si le certificat n'est pas pret
+      debug:
+        msg: >-
+          ATTENTION : le certificat TLS ArgoCD n'est pas encore Ready.
+          Verifie que le DNS de {{ argocd_hostname }} est un CNAME vers le
+          NLB Traefik (kubectl -n traefik get svc traefik) et inspecte :
+          kubectl describe certificate -n argocd argocd-server-tls
+      when: cert_status.stdout != "True"
+
+    # --- Resume final ---
+    - name: Afficher les informations d'acces ArgoCD
+      debug:
+        msg: |
+          ArgoCD est installe et accessible :
+          - URL : https://{{ argocd_hostname }}/  (TLS Let's Encrypt via cert-manager)
+          - Utilisateur : admin
+          - Mot de passe :
+            kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d && echo
+          - Assure-toi que {{ argocd_hostname }} est un CNAME vers le NLB Traefik

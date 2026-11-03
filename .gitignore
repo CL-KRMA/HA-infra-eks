@@ -1,0 +1,50 @@
+# Terraform
+.terraform/
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfvars
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Fichiers de cache
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# Kubeconfig genere par ansible (aws eks update-kubeconfig)
+kubeconfig
+
+# Variables
+*.tfvars
+*.tfvars.json
+!example.tfvars
+
+# Fichiers temporaires
+*.tmp
+*.log
+*.pid
+
+# Environment
+.env
+.env.local
+
+# Sauvegardes generees par scripts/set-domain.sh
+*.bak
+
+# Vault Ansible (secrets) - ne jamais committer en clair
+ansible/secrets/vault.yml
+*.vault_pass
+vault_pass.txt
+
+# Backend S3 : config propre au compte (generee par scripts/bootstrap-backend.sh)
+terraform/backend.hcl
+terraform/terraform.tfstate.pre-s3-backup

@@ -1,0 +1,130 @@
+name: CI infra
+
+# Vérifications statiques du dépôt d'infrastructure (aucun accès AWS requis,
+# aucun secret nécessaire) : Terraform, Ansible, scripts shell.
+# Le déploiement reste manuel (terraform apply + ansible-playbook).
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Annule l'exécution précédente d'une même branche / PR quand on repousse
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 1. Terraform : format, validation, lint
+  terraform:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Deux racines Terraform indépendantes : le cluster et le bootstrap du backend
+        dir: [terraform, terraform/bootstrap]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          # Compatible avec required_version = ">= 1.11, < 2.0"
+          terraform_version: "<1.12.0"
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive -diff
+        working-directory: ${{ matrix.dir }}
+
+      # -backend=false : le backend S3 (backend "s3" {}) n'est pas joignable en CI
+      - name: Terraform init
+        run: terraform init -backend=false -input=false
+        working-directory: ${{ matrix.dir }}
+
+      - name: Terraform validate
+        run: terraform validate
+        working-directory: ${{ matrix.dir }}
+
+      - uses: terraform-linters/setup-tflint@v4
+
+      - name: TFLint
+        run: tflint --chdir=.
+        working-directory: ${{ matrix.dir }}
+
+  # 2. Analyse de sécurité de la config Terraform (Checkov)
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer Checkov
+        run: pip install checkov==3.4.0
+
+      # --skip-check : choix assumés pour un projet perso (coût / sur-ingénierie)
+      #   CKV2_AWS_62  notifications d'événements S3 (bucket tfstate)
+      #   CKV_AWS_18   journaux d'accès S3 (bucket tfstate)
+      #   CKV_AWS_144  réplication inter-régions S3 (bucket tfstate)
+      #   CKV2_AWS_64  politique KMS explicite (la politique par défaut suffit)
+      #   CKV2_AWS_11  VPC Flow Logs (coût)
+      # --soft-fail-on : vrais points à améliorer, affichés mais non bloquants
+      #   CKV_AWS_37   logs du control plane EKS
+      #   CKV_AWS_58   chiffrement des secrets Kubernetes (KMS)
+      #   CKV_AWS_38/39 endpoint API public (restreint via allowed_api_cidr)
+      #   CKV_AWS_130  IP publique par défaut sur les subnets publics
+      #   CKV2_AWS_12  security group par défaut du VPC
+      # Toute NOUVELLE régression de sécurité fait échouer le job.
+      - name: Checkov
+        run: |
+          checkov -d terraform --framework terraform --compact --quiet \
+            --skip-check CKV2_AWS_62,CKV_AWS_18,CKV_AWS_144,CKV2_AWS_64,CKV2_AWS_11 \
+            --soft-fail-on CKV_AWS_37,CKV_AWS_58,CKV_AWS_38,CKV_AWS_39,CKV_AWS_130,CKV2_AWS_12
+
+  # 3. Ansible : syntaxe et lint
+  ansible:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ansible
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer Ansible
+        run: pip install ansible-core==2.21.5 ansible-lint==26.10.1
+
+      # secrets/vault.yml est ignoré par git : on utilise le modèle pour que
+      # `vars_files` se résolve. Reste sur le runner, jamais commité.
+      - name: Préparer le vault factice
+        run: cp secrets/vault.yml.example secrets/vault.yml
+
+      - name: Vérifier la syntaxe des playbooks
+        run: |
+          for pb in site.yml playbooks/install-terraform.yml playbooks/install-prerequisites.yml; do
+            echo "== $pb"
+            ansible-playbook -i hosts "$pb" --syntax-check
+          done
+
+      # Profil "min" : seul niveau que les playbooks actuels satisfont.
+      # Monter vers "basic" demande d'ajouter les noms complets de modules
+      # (ansible.builtin.*) et des changed_when sur les commandes.
+      - name: ansible-lint
+        run: ansible-lint --profile min site.yml playbooks/
+
+  # 4. Scripts shell
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # shellcheck est préinstallé sur ubuntu-latest
+      - name: ShellCheck
+        run: shellcheck --severity=warning scripts/*.sh

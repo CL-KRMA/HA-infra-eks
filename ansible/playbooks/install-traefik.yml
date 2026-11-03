@@ -1,0 +1,87 @@
+---
+# ============================================================
+# install-traefik.yml
+#
+# K3s embarquait Traefik ; EKS n'a pas d'Ingress controller par
+# defaut. On installe donc Traefik via Helm, expose par un Network
+# Load Balancer AWS (cree automatiquement par le Service
+# type=LoadBalancer grace a l'annotation aws-load-balancer-type=nlb).
+#
+# Les Ingress des playbooks suivants gardent ingressClassName: traefik.
+#
+# Apres ce playbook : creer un enregistrement DNS CNAME pour
+# argocd.<domaine> et monitoring.<domaine> vers le hostname du NLB
+# affiche en fin de playbook (un seul NLB, multi-AZ, pas d'IP fixe).
+# ============================================================
+- name: Installer Traefik (Ingress controller) sur EKS
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  vars:
+    # Vide = derniere version du chart. Pour figer : traefik_chart_version: "XX.Y.Z"
+    traefik_chart_version: ""
+
+  tasks:
+    - name: Ajouter le repo Helm Traefik
+      command: helm repo add traefik https://traefik.github.io/charts --force-update
+      changed_when: false
+
+    - name: Mettre a jour les repos Helm
+      command: helm repo update
+      changed_when: false
+
+    - name: Deployer/mettre a jour Traefik via Helm
+      command: >
+        helm upgrade --install traefik traefik/traefik
+        --namespace traefik --create-namespace
+        {{ ('--version ' ~ traefik_chart_version) if traefik_chart_version | length > 0 else '' }}
+        --wait --timeout 5m
+        -f -
+      args:
+        stdin: |
+          deployment:
+            replicas: 3
+          # 1 replica par AZ : la perte d'une zone laisse 2 replicas.
+          # ScheduleAnyway : si le cluster est temporairement sur moins
+          # de zones (noeud en panne), les pods restent planifiables.
+          topologySpreadConstraints:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: traefik
+              maxSkew: 1
+              topologyKey: topology.kubernetes.io/zone
+              whenUnsatisfiable: ScheduleAnyway
+          ingressClass:
+            enabled: true
+            isDefaultClass: true
+          service:
+            type: LoadBalancer
+            annotations:
+              service.beta.kubernetes.io/aws-load-balancer-type: nlb
+              # Le NLB repartit le trafic vers les replicas de toutes les AZ
+              service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+
+    - name: Attendre que le NLB AWS ait un hostname
+      command: >
+        kubectl -n traefik get svc traefik
+        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+      register: nlb_hostname
+      retries: 30
+      delay: 10
+      until: nlb_hostname.stdout | length > 0
+      changed_when: false
+
+    - name: Afficher les instructions DNS
+      debug:
+        msg: |
+          Traefik est expose via le NLB AWS :
+            {{ nlb_hostname.stdout }}
+
+          Cree maintenant ces enregistrements DNS (type CNAME) :
+            {{ argocd_hostname }}      -> {{ nlb_hostname.stdout }}
+            {{ monitoring_hostname }}  -> {{ nlb_hostname.stdout }}
+
+          et attends la propagation AVANT l'etape cert-manager / TLS
+          (le challenge HTTP-01 de Let's Encrypt passe par ce NLB, port 80).

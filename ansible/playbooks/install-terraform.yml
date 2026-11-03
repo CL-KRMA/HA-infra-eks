@@ -1,0 +1,101 @@
+---
+# ============================================================
+# Playbook : installer Terraform sur cette machine Ubuntu
+# S'execute sur localhost (la VM elle-meme, pas un noeud distant)
+# ============================================================
+- name: Installer Terraform (HashiCorp) sur Ubuntu
+  hosts: localhost
+  connection: local
+  become: yes
+  vars:
+    terraform_version: ""   # laisser vide = derniere version disponible via apt
+
+  tasks:
+    - name: "Mettre a jour le cache apt (tolerant : un depot en erreur ne bloque pas)"
+      command: apt-get update
+      register: apt_update
+      retries: 3
+      delay: 5
+      until: apt_update.rc == 0
+      changed_when: false
+      failed_when: false
+
+    - name: Afficher la cause si apt-get update a echoue
+      debug:
+        msg: |
+          apt-get update a echoue (code {{ apt_update.rc }}). Les dernieres lignes :
+          {{ (apt_update.stdout_lines + apt_update.stderr_lines)[-15:] | join('\n') }}
+
+          On continue : les paquets deja en cache ou deja installes passeront,
+          sinon l'installation echouera juste apres avec une erreur explicite.
+          Diagnostic : lance `sudo apt-get update` et lis les lignes Err:/E:/W:.
+      when: apt_update.rc != 0
+
+    - name: Installer les dependances de base
+      apt:
+        name:
+          - gnupg
+          - software-properties-common
+          - curl
+          - ca-certificates
+          - lsb-release
+        state: present
+        update_cache: no
+
+    - name: Creer le repertoire pour les cles GPG (methode moderne, apt-key est deprecie)
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Telecharger et installer la cle GPG officielle HashiCorp
+      shell: |
+        curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o /etc/apt/keyrings/hashicorp.gpg
+      args:
+        creates: /etc/apt/keyrings/hashicorp.gpg
+
+    - name: "Recuperer le nom de la distribution Ubuntu (ex. jammy, noble)"
+      command: lsb_release -cs
+      register: ubuntu_codename
+      changed_when: false
+
+    - name: Ajouter le depot officiel HashiCorp
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com {{ ubuntu_codename.stdout }} main"
+        state: present
+        filename: hashicorp
+        update_cache: no
+
+    - name: "Mettre a jour le cache apt apres ajout du depot HashiCorp"
+      command: apt-get update
+      register: apt_update
+      retries: 3
+      delay: 5
+      until: apt_update.rc == 0
+      changed_when: false
+      failed_when: false
+
+    - name: Afficher la cause si apt-get update a echoue
+      debug:
+        msg: |
+          apt-get update a echoue (code {{ apt_update.rc }}). Les dernieres lignes :
+          {{ (apt_update.stdout_lines + apt_update.stderr_lines)[-15:] | join('\n') }}
+
+          On continue : les paquets deja en cache ou deja installes passeront,
+          sinon l'installation echouera juste apres avec une erreur explicite.
+          Diagnostic : lance `sudo apt-get update` et lis les lignes Err:/E:/W:.
+      when: apt_update.rc != 0
+
+    - name: Installer Terraform
+      apt:
+        name: "terraform{{ '=' + terraform_version if terraform_version | length > 0 else '' }}"
+        state: present
+
+    - name: Verifier l'installation (afficher la version)
+      command: terraform -version
+      register: tf_version
+      changed_when: false
+
+    - name: Afficher la version installee
+      debug:
+        var: tf_version.stdout_lines

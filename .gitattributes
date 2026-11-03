@@ -1,0 +1,25 @@
+# Detection automatique du texte, normalisation en LF dans le depot
+* text=auto
+
+# Fichiers executes ou lus sous Linux : toujours LF, meme apres un clone sous Windows
+*.sh       text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.tf       text eol=lf
+*.tfvars   text eol=lf
+*.j2       text eol=lf
+*.py       text eol=lf
+*.json     text eol=lf
+*.md       text eol=lf
+Dockerfile text eol=lf
+hosts      text eol=lf
+.gitignore text eol=lf
+
+# Lock file Terraform (genere par terraform init, versionne dans git)
+.terraform.lock.hcl text eol=lf
+
+# Fichiers binaires : jamais modifies par Git
+*.pem      binary
+*.png      binary
+*.jpg      binary
+*.pdf      binary

@@ -1,0 +1,138 @@
+---
+# ============================================================
+# install-cert-manager.yml
+#
+# Installe cert-manager (Helm) et cree deux ClusterIssuer Let's
+# Encrypt (staging + prod) utilisant le challenge HTTP-01 via
+# l'IngressClass "traefik" (voir playbooks/install-traefik.yml).
+#
+# Pre-requis IMPORTANT :
+#   - Le DNS de argocd.domain.com et monitoring.domain.com doit
+#     DEJA etre un CNAME vers le hostname du NLB Traefik (affiche par
+#     install-traefik.yml) avant que les certificats puissent etre
+#     emis : le challenge HTTP-01 est valide par Let's Encrypt en
+#     HTTP (port 80) depuis l'exterieur.
+#
+# Variable a definir : letsencrypt_email (email de contact Let's
+# Encrypt, utilise pour les alertes d'expiration). A passer via
+# --extra-vars ou a modifier ci-dessous.
+#
+# Usage :
+#   ansible-playbook site.yml --tags cert-manager \
+#     -e letsencrypt_email=TON_VRAI_EMAIL@TON_DOMAINE.com
+# ============================================================
+
+- name: Installer cert-manager et configurer Let's Encrypt
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  vars:
+    # A personnaliser (obligatoire pour Let's Encrypt) :
+    letsencrypt_email: "changeme@domain.com"
+
+  tasks:
+    # --- Garde-fou : refuse de continuer avec un email placeholder ou
+    #     un domaine reserve (example.com/org/net), rejete explicitement
+    #     par Let's Encrypt (erreur ACME invalidContact sinon) ---
+    - name: Verifier que letsencrypt_email est une vraie adresse (pas un placeholder)
+      assert:
+        that:
+          - letsencrypt_email != "changeme@domain.com"
+          - letsencrypt_email is not search("@example\\.(com|org|net)$")
+        fail_msg: >-
+          letsencrypt_email="{{ letsencrypt_email }}" est un placeholder
+          ou un domaine reserve (example.com/org/net), rejete par Let's
+          Encrypt (erreur ACME invalidContact). Relance avec une vraie
+          adresse : -e letsencrypt_email=ton.email@tondomaine.com
+        success_msg: "letsencrypt_email semble valide."
+
+    - name: Ajouter le repo Helm Jetstack (cert-manager)
+      command: helm repo add jetstack https://charts.jetstack.io --force-update
+      changed_when: false
+
+    - name: Mettre a jour les repos Helm
+      command: helm repo update
+      changed_when: false
+
+    # --- Installer/mettre a jour cert-manager (avec ses CRDs) ---
+    - name: Deployer/mettre a jour cert-manager via Helm
+      command: >
+        helm upgrade --install cert-manager jetstack/cert-manager
+        --namespace cert-manager --create-namespace
+        --version {{ cert_manager_version }}
+        --set crds.enabled=true
+        --wait --timeout 5m
+
+    - name: Attendre que le webhook cert-manager soit disponible
+      command: kubectl wait --for=condition=Available --timeout=120s deployment/cert-manager-webhook -n cert-manager
+      changed_when: false
+
+    # --- ClusterIssuer Let's Encrypt STAGING (pour tester sans
+    #     epuiser le rate-limit de prod pendant les premiers essais) ---
+    - name: Deployer le ClusterIssuer letsencrypt-staging
+      command: kubectl apply -f -
+      args:
+        stdin: |
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-staging
+          spec:
+            acme:
+              server: https://acme-staging-v02.api.letsencrypt.org/directory
+              email: {{ letsencrypt_email }}
+              privateKeySecretRef:
+                name: letsencrypt-staging-account-key
+              solvers:
+                - http01:
+                    ingress:
+                      ingressClassName: traefik
+
+    # --- ClusterIssuer Let's Encrypt PROD (utilise par les Ingress
+    #     ArgoCD et Grafana via l'annotation cert-manager.io/cluster-issuer) ---
+    - name: Deployer le ClusterIssuer letsencrypt-prod
+      command: kubectl apply -f -
+      args:
+        stdin: |
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-prod
+          spec:
+            acme:
+              server: https://acme-v02.api.letsencrypt.org/directory
+              email: {{ letsencrypt_email }}
+              privateKeySecretRef:
+                name: letsencrypt-prod-account-key
+              solvers:
+                - http01:
+                    ingress:
+                      ingressClassName: traefik
+
+    - name: Verifier que les ClusterIssuer sont prets (Ready=True)
+      command: kubectl get clusterissuer -o wide
+      register: issuers
+      retries: 10
+      delay: 10
+      until: "'True' in issuers.stdout"
+      changed_when: false
+
+    - debug:
+        msg: "{{ issuers.stdout_lines }}"
+
+    - name: Resume cert-manager
+      debug:
+        msg: |
+          cert-manager installe, ClusterIssuer "letsencrypt-staging" et
+          "letsencrypt-prod" prets.
+
+          Les Ingress ArgoCD et Grafana (etapes suivantes) utilisent
+          automatiquement letsencrypt-prod via l'annotation
+          cert-manager.io/cluster-issuer.
+
+          Rappel : le DNS de {{ argocd_hostname }} et {{ monitoring_hostname }}
+          doit deja etre un CNAME vers le NLB Traefik
+          (kubectl -n traefik get svc traefik) pour que le challenge
+          HTTP-01 reussisse.

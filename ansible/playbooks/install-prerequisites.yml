@@ -1,0 +1,200 @@
+---
+# ============================================================
+# install-prerequisites.yml
+#
+# Installe sur la machine de controle (Ubuntu/Debian, localhost) tous
+# les outils dont le projet a besoin :
+#   - Terraform   (via playbooks/install-terraform.yml, depot HashiCorp)
+#   - AWS CLI v2  (installeur officiel AWS)
+#   - kubectl     (binaire officiel, version pinnee)
+#   - Helm 3      (script officiel, version pinnee)
+#   - curl, unzip (dependances de base)
+#
+# Non installes ici (a faire avant) :
+#   - Ansible lui-meme (sudo apt install ansible, ou pipx install ansible-core)
+#   - Les credentials AWS (aws configure, ou aws sso login)
+#
+# Usage recommande (depuis la racine du projet) :
+#   ./scripts/install-prerequisites.sh
+# Le script appelle sudo lui-meme puis lance ce playbook en root. Il evite
+# l'erreur "Timed out waiting for become success or become password
+# prompt" causee par sudo-rs (Ubuntu 25.10+), incompatible avec le prompt
+# de mot de passe d'Ansible.
+#
+# Usage direct (si ton sudo est le sudo classique, ou sans mot de passe) :
+#   cd ansible
+#   ansible-playbook playbooks/install-prerequisites.yml --ask-become-pass
+#
+# Idempotent : les outils deja installes ne sont pas retelecharges.
+# Pour mettre a jour kubectl ou Helm, change la version ci-dessous puis
+# supprime le binaire (/usr/local/bin/kubectl ou /usr/local/bin/helm).
+# ============================================================
+
+# ------------------------------------------------------------
+# Play 0 : compatibilite sudo (evite un timeout obscur avec sudo-rs)
+# ------------------------------------------------------------
+- name: "Prerequis 0/2 - Verification de compatibilite sudo"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Lire l'UID courant
+      command: id -u
+      register: current_uid
+      changed_when: false
+
+    - name: Lire la version de sudo
+      command: sudo --version
+      register: sudo_version
+      changed_when: false
+      failed_when: false
+
+    - name: Tester sudo sans mot de passe
+      command: sudo -n true
+      register: sudo_nopass
+      changed_when: false
+      failed_when: false
+
+    - name: Refuser sudo-rs avec mot de passe (incompatible avec become)
+      fail:
+        msg: >-
+          sudo-rs detecte : Ansible ne sait pas lui envoyer le mot de passe
+          (timeout "waiting for become success or become password prompt").
+          Lance plutot : ./scripts/install-prerequisites.sh  (depuis la
+          racine du projet). Il execute ce playbook en root, sans become.
+      when:
+        - current_uid.stdout != "0"
+        - "'sudo-rs' in sudo_version.stdout"
+        - sudo_nopass.rc != 0
+
+# ------------------------------------------------------------
+# Play 1 : Terraform
+# ------------------------------------------------------------
+- name: "Prerequis 1/2 - Terraform"
+  import_playbook: install-terraform.yml
+
+# ------------------------------------------------------------
+# Play 2 : AWS CLI, kubectl, Helm
+# ------------------------------------------------------------
+- name: "Prerequis 2/2 - AWS CLI, kubectl, Helm"
+  hosts: localhost
+  connection: local
+  become: yes
+  vars:
+    # kubectl doit etre a +/- 1 version mineure du cluster
+    # (terraform/main.tf, variable kubernetes_version = 1.35).
+    kubectl_version: "v1.35.0"
+    helm_version: "v3.15.4"
+    arch_map:
+      x86_64: amd64
+      aarch64: arm64
+    aws_arch_map:
+      x86_64: x86_64
+      aarch64: aarch64
+
+  tasks:
+    - name: Verifier que la machine est de la famille Debian/Ubuntu
+      assert:
+        that:
+          - ansible_os_family == "Debian"
+          - ansible_architecture in arch_map
+        fail_msg: >-
+          Ce playbook supporte uniquement Debian/Ubuntu (x86_64 ou aarch64).
+          Detecte : {{ ansible_os_family }} / {{ ansible_architecture }}.
+          Installe a la main : aws cli v2, kubectl, helm 3.
+
+    - name: "Mettre a jour le cache apt (tolerant : un depot en erreur ne bloque pas)"
+      command: apt-get update
+      register: apt_update
+      retries: 3
+      delay: 5
+      until: apt_update.rc == 0
+      changed_when: false
+      failed_when: false
+
+    - name: Afficher la cause si apt-get update a echoue
+      debug:
+        msg: |
+          apt-get update a echoue (code {{ apt_update.rc }}). Les dernieres lignes :
+          {{ (apt_update.stdout_lines + apt_update.stderr_lines)[-15:] | join('\n') }}
+
+          On continue : les paquets deja en cache ou deja installes passeront,
+          sinon l'installation echouera juste apres avec une erreur explicite.
+          Diagnostic : lance `sudo apt-get update` et lis les lignes Err:/E:/W:.
+      when: apt_update.rc != 0
+
+    - name: Installer les dependances de base
+      apt:
+        name:
+          - curl
+          - unzip
+          - ca-certificates
+        state: present
+        update_cache: no
+
+    # --- AWS CLI v2 ---
+    - name: Telecharger l'installeur AWS CLI v2
+      get_url:
+        url: "https://awscli.amazonaws.com/awscli-exe-linux-{{ aws_arch_map[ansible_architecture] }}.zip"
+        dest: /tmp/awscliv2.zip
+        mode: '0644'
+      when: "lookup('ansible.builtin.pipe', 'command -v aws || true') == ''"
+
+    - name: Extraire l'installeur AWS CLI v2
+      unarchive:
+        src: /tmp/awscliv2.zip
+        dest: /tmp
+        remote_src: yes
+      when: "lookup('ansible.builtin.pipe', 'command -v aws || true') == ''"
+
+    - name: Installer AWS CLI v2
+      command: /tmp/aws/install
+      args:
+        creates: /usr/local/bin/aws
+      when: "lookup('ansible.builtin.pipe', 'command -v aws || true') == ''"
+
+    # --- kubectl ---
+    - name: Installer kubectl {{ kubectl_version }}
+      get_url:
+        url: "https://dl.k8s.io/release/{{ kubectl_version }}/bin/linux/{{ arch_map[ansible_architecture] }}/kubectl"
+        dest: /usr/local/bin/kubectl
+        mode: '0755'
+
+    # --- Helm 3 (script officiel, version pinnee) ---
+    - name: Telecharger le script d'installation Helm
+      get_url:
+        url: "https://raw.githubusercontent.com/helm/helm/{{ helm_version }}/scripts/get-helm-3"
+        dest: /tmp/get_helm.sh
+        mode: '0755'
+
+    - name: Installer Helm {{ helm_version }}
+      command: /tmp/get_helm.sh
+      args:
+        creates: /usr/local/bin/helm
+      environment:
+        DESIRED_VERSION: "{{ helm_version }}"
+
+    # --- Verification ---
+    - name: Verifier les versions installees
+      shell: |
+        echo "terraform : $(terraform -version | head -1)"
+        echo "aws       : $(aws --version)"
+        echo "kubectl   : $(kubectl version --client | head -1)"
+        echo "helm      : $(helm version --short)"
+        echo "ansible   : $(ansible --version | head -1)"
+      args:
+        executable: /bin/bash
+      register: versions
+      changed_when: false
+
+    - name: Afficher les versions
+      debug:
+        msg: "{{ versions.stdout_lines }}"
+
+    - name: Rappel credentials AWS
+      debug:
+        msg: >-
+          Outils installes. Il reste a configurer tes credentials AWS
+          (aws configure, ou aws sso login) puis a verifier avec :
+          aws sts get-caller-identity

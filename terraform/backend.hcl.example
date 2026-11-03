@@ -1,0 +1,7 @@
+# Copie en backend.hcl et adapte, ou laisse scripts/bootstrap-backend.sh le generer.
+bucket       = "eks-cluster-tfstate-123456789012-us-east-1"
+key          = "eks/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+kms_key_id   = "arn:aws:kms:us-east-1:123456789012:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+use_lockfile = true   # verrou natif S3 (Terraform >= 1.11), plus besoin de DynamoDB

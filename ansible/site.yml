@@ -1,0 +1,53 @@
+---
+# ============================================================
+# site.yml - Playbook orchestrateur du projet HA-infra-eks-backends3 (EKS)
+#
+# S'execute depuis le dossier ansible/ (ou ansible.cfg pointe
+# vers ./hosts, present dans ce meme dossier).
+#
+# Usage :
+#   cd ansible
+#   ansible-playbook site.yml --ask-vault-pass                -> tout deployer
+#   ansible-playbook site.yml --tags ingress --ask-vault-pass -> uniquement Traefik
+#   (--ask-vault-pass est requis pour toute commande site.yml une fois
+#    secrets/vault.yml chiffre)
+#   ansible-playbook site.yml --skip-tags guestbook --ask-vault-pass -> tout sauf la demo
+#
+# TLS (Let's Encrypt) : l'etape cert-manager necessite un email de
+# contact valide, a fournir via --extra-vars :
+#   ansible-playbook site.yml -e letsencrypt_email=TON_VRAI_EMAIL@TON_DOMAINE.com
+#
+# Prerequis : terraform apply deja fait (voir scripts/update-ip.sh),
+# aws cli, kubectl et helm installes sur la machine de controle, et
+# l'identite AWS utilisee pour terraform apply (c'est elle qui est
+# admin du cluster).
+#
+# NB : install-terraform.yml n'est PAS inclus ici car il s'execute
+# en amont, pour outiller la machine de controle (voir README.md).
+# Il se lance separement si besoin :
+#   ansible-playbook playbooks/install-terraform.yml
+# ============================================================
+
+- name: "Etape 1 - Acces au cluster EKS (kubeconfig, StorageClass gp3)"
+  import_playbook: playbooks/configure-cluster.yml
+  tags: cluster
+
+- name: "Etape 2 - Ingress Traefik (NLB AWS)"
+  import_playbook: playbooks/install-traefik.yml
+  tags: ingress
+
+- name: "Etape 3 - cert-manager + Let's Encrypt (TLS)"
+  import_playbook: playbooks/install-cert-manager.yml
+  tags: cert-manager
+
+- name: "Etape 4 - ArgoCD (GitOps)"
+  import_playbook: playbooks/install-argocd.yml
+  tags: argocd
+
+- name: "Etape 5 - Monitoring (Prometheus + Grafana)"
+  import_playbook: playbooks/install-monitoring.yml
+  tags: monitoring
+
+- name: "Etape 6 - Application de demo (guestbook via ArgoCD)"
+  import_playbook: playbooks/guestbook.yml
+  tags: guestbook

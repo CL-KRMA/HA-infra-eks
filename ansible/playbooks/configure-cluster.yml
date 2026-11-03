@@ -1,0 +1,101 @@
+---
+# ============================================================
+# configure-cluster.yml
+#
+# Remplace l'ancien install-k3s.yml : le cluster lui-meme (control
+# plane + noeuds) est cree par Terraform. Ce playbook :
+#   1. verifie que aws cli, kubectl et helm sont installes ;
+#   2. genere un kubeconfig dedie au projet (aws eks update-kubeconfig) ;
+#   3. attend que les noeuds soient Ready et que le driver EBS CSI tourne ;
+#   4. cree la StorageClass gp3 (par defaut) avec
+#      volumeBindingMode=WaitForFirstConsumer : le volume EBS est cree
+#      dans l'AZ ou le pod est effectivement planifie.
+#
+# L'identite AWS utilisee ici doit etre celle qui a lance
+# `terraform apply` (admin du cluster via l'access entry creee par
+# bootstrap_cluster_creator_admin_permissions).
+# ============================================================
+- name: Configurer l'acces au cluster EKS
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+
+  tasks:
+    - name: Verifier que les outils requis sont installes
+      command: "which {{ item }}"
+      loop:
+        - aws
+        - kubectl
+        - helm
+      changed_when: false
+      register: tools_check
+      failed_when: tools_check.rc != 0
+
+    - name: Generer le kubeconfig du projet
+      command: >
+        aws eks update-kubeconfig
+        --name {{ cluster_name }}
+        --region {{ aws_region }}
+        --kubeconfig {{ kubeconfig_path }}
+      changed_when: false
+
+    - name: Verifier l'acces a l'API Kubernetes
+      command: kubectl get --raw /readyz
+      register: api_ready
+      retries: 10
+      delay: 15
+      until: api_ready.rc == 0
+      changed_when: false
+
+    - name: Attendre que les noeuds soient enregistres
+      command: kubectl get nodes --no-headers
+      register: nodes
+      retries: 20
+      delay: 15
+      until: nodes.rc == 0 and nodes.stdout_lines | length > 0
+      changed_when: false
+
+    - name: Attendre que tous les noeuds soient Ready
+      command: kubectl wait --for=condition=Ready nodes --all --timeout=300s
+      changed_when: false
+
+    - name: Attendre que le driver EBS CSI soit disponible
+      command: kubectl -n kube-system rollout status deployment/ebs-csi-controller --timeout=300s
+      changed_when: false
+
+    - name: Retirer le statut "par defaut" de la StorageClass gp2 (si presente)
+      command: >
+        kubectl patch storageclass gp2 -p
+        '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"false"}}}'
+      register: gp2_patch
+      failed_when: gp2_patch.rc != 0 and 'NotFound' not in gp2_patch.stderr
+      changed_when: "'patched' in gp2_patch.stdout and 'no change' not in gp2_patch.stdout"
+
+    - name: Creer la StorageClass gp3 par defaut
+      command: kubectl apply -f -
+      args:
+        stdin: |
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: gp3
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+          provisioner: ebs.csi.aws.com
+          parameters:
+            type: gp3
+            encrypted: "true"
+          volumeBindingMode: WaitForFirstConsumer
+          allowVolumeExpansion: true
+          reclaimPolicy: Delete
+
+    - name: Lister les noeuds du cluster
+      command: kubectl get nodes -o wide
+      register: final_nodes
+      changed_when: false
+
+    - name: Afficher le resultat
+      debug:
+        var: final_nodes.stdout_lines

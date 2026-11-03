@@ -1,0 +1,20 @@
+---
+# ============================================================
+# Variables communes a tous les playbooks.
+# Chargees automatiquement par Ansible (group_vars/all/).
+# ============================================================
+
+# --- Doivent correspondre au Terraform (terraform/main.tf) ---
+cluster_name: "eks-cluster"   # var.cluster_name
+aws_region: "us-east-1"       # var.region
+
+# --- Kubeconfig dedie au projet (genere par configure-cluster.yml,
+#     ignore par git). N'ecrase pas ~/.kube/config. ---
+kubeconfig_path: "{{ inventory_dir }}/../kubeconfig"
+
+# --- Domaine (remplace par scripts/set-domain.sh) ---
+argocd_hostname: "argocd.domain.com"
+monitoring_hostname: "monitoring.domain.com"
+
+# --- Versions des outils ---
+cert_manager_version: "v1.15.3"

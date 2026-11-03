@@ -1,0 +1,10 @@
+# ============================================================
+# Inventaire EKS : tout s'execute depuis la machine de controle.
+#
+# Contrairement a la version K3s, il n'y a plus de masters/workers a
+# joindre en SSH : le control plane et les noeuds sont geres par EKS.
+# Les playbooks pilotent le cluster avec kubectl/helm via un kubeconfig
+# genere par `aws eks update-kubeconfig` (voir playbooks/configure-cluster.yml).
+# ============================================================
+[local]
+localhost ansible_connection=local ansible_python_interpreter="{{ ansible_playbook_python }}"
